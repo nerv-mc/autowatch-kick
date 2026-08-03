@@ -141,6 +141,14 @@ async def async_campaign_checker_loop():
                         camp_name = camp.get("name", "Slots Drop")
 
                         add_to_daily_blacklist_with_delay(s_lower, delay_minutes=10)
+                        
+                        # ---> TAMBAHKAN KODE INI SUPAYA OTOMATIS PUSH KE VPS <---
+                        try:
+                            vps_payload = {"streamer": s_lower, "value": camp_name}
+                            requests.post("https://kickbot-tracker.online/api/v1/record-drop", json=vps_payload, timeout=5)
+                        except Exception as e:
+                            print(f"Gagal sync ke VPS: {e}")
+                        # ---------------------------------------------------------
 
                         msg_t1 = (
                             f"🚨 <b>[TIPE 1: DROP RELEASED REAL-TIME!]</b>\n\n"
