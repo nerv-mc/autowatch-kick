@@ -9,10 +9,11 @@ TELEGRAM_CHAT_ID = "-5447124497"
 
 API_BASE_URL = "https://web-production-b7b73.up.railway.app"
 HEARTBEAT_INTERVAL = 10
-CLAIM_CHECK_INTERVAL = 60
+CLAIM_CHECK_INTERVAL = 60  # Cek inventory tiap 60 detik
 
 active_bot_pages = {}
 claimed_history = set()
+released_history = set()
 browser_instance = None
 
 def handle_async_exception(loop, context):
@@ -20,20 +21,6 @@ def handle_async_exception(loop, context):
     if msg and ("No session with given id" in str(msg) or "detachFromTarget" in str(msg)):
         return
     loop.default_exception_handler(context)
-
-async def send_telegram_alert_async(session, message: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            await resp.text()
-    except Exception as e:
-        print(f"⚠️ Gagal kirim Telegram: {e}")
 
 def clean_cookie_val(val: str) -> str:
     return urllib.parse.unquote(val)
@@ -53,7 +40,7 @@ BOT_ACCOUNTS = [
     {
         "bot_id": "Inisaripudin",
         "token": "403575458%7CqWMGNsmBD0by7jSFMv5NmLuVEK6LGHWZcZLXDgEj",
-        "session": "eyJpdiI6IjN0SGRQQXBEdWR0cllUd3BjN3ZMQ3c9PSIsInZhbHVlIjoiUHF2NHc2TVhSem9BbENwcWNtYVQ2QjVtajhmclpGa21HTHorOGVJM2NOZ3FIWmFHUHZiSkhvSWdWMlIwSEpFSkxUZ0xwVWZ4Z1FDRVBpK0pmY2l3QVRyRUNOY0dTTm02UnJ2V3l3OGFZWkFLUkwxNXVycnR6L3ZvYUF2NmIxTSsiLCJtYWMiOiI5MmI3OTk4NDA1MzE3MzI0ODQxMTBjMDVmMDZmNzcxNGZkZGFjMDU3NjIwZDI2OTJjMGJhZmE3YWFmNjY3NzRkIiwidGFnIjoiIn0%3D"
+        "session": "eyJpdiI6IjN0SGRQQXBEdWR0cllUd3BjN3ZMQ3c9PSIsInZhbHVlIjoiUHF2NHc2TVhSem9BbENwcWNtYVQ2QjVtajhmclpGa21HTHorOGVJM2NOZ3FIWmFHUHZiSkhvSWdWMlIwSEpFSkxUZ0xwVWZ4Z1FDRVBpK0pmY2l3QVRyRUNOY0dTTm02UnJ2V3l3OGFZWkFLUkwxNXVycnR6L3ZvYUF2NmIxTSsiLCJtYWMiOiI9MmI3OTk4NDA1MzE3MzI0ODQxMTBjMDVmMDZmNzcxNGZkZGFjMDU3NjIwZDI2OTJjMGJhZmE3YWFmNjY3NzRkIiwidGFnIjoiIn0%3D"
     },
     {
         "bot_id": "Suraptbegg",
@@ -72,7 +59,8 @@ BOT_ACCOUNTS = [
     }
 ]
 
-async def create_streamer_page(browser, account_info: dict, streamer_name: str):
+# ================== HELPER TAB STREAMER ==================
+async def create_streamer_page(browser, account_info: dict, streamer_name: str, http_session):
     page = await browser.newPage()
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
 
@@ -88,6 +76,8 @@ async def create_streamer_page(browser, account_info: dict, streamer_name: str):
     try:
         await page.goto(f"https://kick.com/{streamer_name}", {'waitUntil': 'domcontentloaded', 'timeout': 30000})
         await asyncio.sleep(3)
+
+        # Force Play Video Player
         await page.evaluate('''() => {
             const v = document.querySelector('video');
             if (v) { v.muted = false; v.play().catch(() => {}); }
@@ -97,7 +87,9 @@ async def create_streamer_page(browser, account_info: dict, streamer_name: str):
 
     return page
 
+# ================== INVENTORY AUTO CLAIMER ==================
 async def check_and_execute_claim(browser, account_info: dict) -> list:
+    """Membuka tab inventory, mencari tombol 'Klaim' / 'Claim' yang unlocked, lalu mengeklik tombol tersebut."""
     claim_page = None
     try:
         claim_page = await browser.newPage()
@@ -112,34 +104,46 @@ async def check_and_execute_claim(browser, account_info: dict) -> list:
                 {'name': 'kick_session', 'value': sess, 'domain': '.kick.com', 'path': '/', 'secure': True}
             )
 
-        await claim_page.goto("https://kick.com/drops/inventory", {'waitUntil': 'domcontentloaded', 'timeout': 30000})
+        await claim_page.goto("https://kick.com/drops/inventory", {'waitUntil': 'networkidle2', 'timeout': 30000})
         await asyncio.sleep(4)
 
-        claimed_streamers = await claim_page.evaluate('''() => {
-            const buttons = Array.from(document.querySelectorAll('button'));
+        # Tutup pop-up Daily Reward jika muncul
+        await claim_page.evaluate('''() => {
+            const dialogs = document.querySelectorAll('div[role="dialog"]');
+            dialogs.forEach(d => {
+                const closeBtn = d.querySelector('button');
+                if (closeBtn) closeBtn.click();
+            });
+        }''')
+        await asyncio.sleep(1)
+
+        # Eksekusi Klik Claim
+        claimed_items = await claim_page.evaluate('''() => {
             const successList = [];
+            const elements = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 
-            for (const btn of buttons) {
-                if (btn.closest('div[role="dialog"]')) continue;
+            for (const el of elements) {
+                const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
 
-                const text = (btn.textContent || '').trim().toLowerCase();
-                const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                if (aria.includes('daily reward') || text.includes('daily')) continue;
 
-                if (aria.includes('daily reward') || aria.includes('hadiah harian') || text.includes('daily')) continue;
+                const isClaimBtn = text === 'klaim' || text === 'claim' || aria.includes('klaim') || (aria.includes('claim') && !aria.includes('daily'));
+                const isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true' || text.includes('claimed') || text.includes('diklaim');
 
-                const isClaimButton = text === 'klaim' || text === 'claim' || aria.includes('klaim') || (aria.includes('claim') && !aria.includes('daily'));
-                const isAlreadyClaimed = text.includes('claimed') || text.includes('diklaim') || btn.disabled || btn.offsetParent === null;
-
-                if (isClaimButton && !isAlreadyClaimed) {
-                    btn.click();
-                    successList.push("claimed_item");
+                if (isClaimBtn && !isDisabled) {
+                    try {
+                        el.scrollIntoView();
+                        el.click();
+                        successList.push("claimed_item");
+                    } catch (e) {}
                 }
             }
             return successList;
         }''')
 
         await asyncio.sleep(2)
-        return claimed_streamers
+        return claimed_items
 
     except Exception:
         return []
@@ -150,6 +154,7 @@ async def check_and_execute_claim(browser, account_info: dict) -> list:
             except Exception:
                 pass
 
+# ================== BATCH CLAIMER (TIPE 2 EVENT) ==================
 async def batch_inventory_claimer(browser, http_session):
     await asyncio.sleep(20)
 
@@ -166,9 +171,9 @@ async def batch_inventory_claimer(browser, http_session):
 
                     if claim_key not in claimed_history:
                         claimed_history.add(claim_key)
-                        print(f"🎉 [CLAIM SUCCESS] Bot {bot_id} BERHASIL KLAIM DROP {streamer_name}!")
+                        print(f"🎉 [TIPE 2: BOT CLAIM SUCCESS] Bot {bot_id} BERHASIL KLAIM DROP {streamer_name}!")
 
-                        # 1. Laporkan ke Railway (Railway akan menunda blacklist selama 10 Menit)
+                        # Kirim laporan ke Backend Railway (Memicu Notifikasi Tipe 2)
                         try:
                             await http_session.post(
                                 f"{API_BASE_URL}/record-drop",
@@ -176,24 +181,11 @@ async def batch_inventory_claimer(browser, http_session):
                                 timeout=aiohttp.ClientTimeout(total=5)
                             )
                         except Exception as e:
-                            print(f"⚠️ Gagal lapor drop: {e}")
-
-                        # 2. Kirim Notifikasi Telegram Instan
-                        msg = (
-                            f"🎉 <b>[DROP SUCCESSFULLY CLAIMED!]</b>\n\n"
-                            f"🤖 Bot Account: <code>{bot_id}</code>\n"
-                            f"📺 Streamer Target: <b>{streamer_name}</b>\n"
-                            f"⚡ Status: <b>Berhasil claim drop stream {streamer_name}!</b>\n"
-                            f"⏳ Blacklist Delay: <b>Streaming tetap tayang 10 menit lagi untuk bot lain.</b>\n\n"
-                            f"📲 <b>Silahkan cek akun!</b>"
-                        )
-                        await send_telegram_alert_async(http_session, msg)
-
-                        # CATATAN: Tab TIDAK DILAKUKAN force-close di sini agar bot lain yang sedang tonton sempat selesaikan watch time.
-                        # Nanti tab akan otomatis ditutup oleh Railway setelah masa tenggang 10 menit berakhir.
+                            print(f"⚠️ Gagal lapor claim ke Railway: {e}")
 
         await asyncio.sleep(CLAIM_CHECK_INTERVAL)
 
+# ================== WORKER BOT MAIN ==================
 async def start_single_worker(account_info, browser, http_session):
     bot_id = account_info["bot_id"]
     api_url = f"{API_BASE_URL}/assign-streamer/{bot_id}"
@@ -217,10 +209,10 @@ async def start_single_worker(account_info, browser, http_session):
                     current_streamers_set = set(current_tabs.keys())
                     new_streamers_set = set(target_streamers)
 
-                    # Close tab HANYA setelah masa tenggang 10 menit blacklist terpenuhi (diatur oleh Railway)
+                    # Close tab HANYA jika diperintahkan Backend (misal setelah Grace Period 10m habis)
                     to_remove = current_streamers_set - new_streamers_set
                     for s in to_remove:
-                        print(f"❌ [{bot_id}] Closing Tab (Blacklist 10m Met) -> {s}")
+                        print(f"❌ [{bot_id}] Closing Tab -> {s}")
                         try:
                             await current_tabs[s].close()
                         except Exception:
@@ -231,7 +223,7 @@ async def start_single_worker(account_info, browser, http_session):
                     to_add = new_streamers_set - current_streamers_set
                     for s in to_add:
                         print(f"🔄 [{bot_id}] Opening New Tab -> {s}")
-                        p = await create_streamer_page(browser, account_info, s)
+                        p = await create_streamer_page(browser, account_info, s, http_session)
                         current_tabs[s] = p
 
                     active_list = list(current_tabs.keys())

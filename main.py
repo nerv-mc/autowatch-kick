@@ -54,15 +54,15 @@ def init_db():
 
 init_db()
 
-KICK_ACCESS_TOKEN = "YJJHNZY3NJETNMU5MS0ZNDUXLWI3NDUTMZQZNDFMYJFLMZVI"
-CATEGORY_ID = 28
-LIMIT_LIVE = 1000  # Ambil seluruh streamer live di Slots & Casino
 MAX_STREAMS_PER_BOT = 3
 
 bot_assignments: Dict[str, dict] = {}
 daily_blacklisted_streamers: Dict[str, Set[str]] = {}
 blacklisted_pending_until: Dict[str, float] = {}
 seen_campaign_ids: Set[str] = set()
+
+# Menyimpan daftar streamer aktif yang ditemukan dari API Drops untuk kebutuhan dashboard & bot manager
+active_drops_streamers: List[dict] = []
 
 ALL_REGISTERED_BOTS = [
     "RestyFadilah12", "Asnbumai", "Inisaripudin", 
@@ -99,7 +99,6 @@ def is_blacklisted_today(streamer: str) -> bool:
 
     return False
 
-# ================== ASYNC BACKGROUND DETECTOR ==================
 def is_slots_casino_campaign(camp: dict) -> bool:
     name = camp.get('name', '')
     cat_obj = camp.get('category', {})
@@ -108,7 +107,9 @@ def is_slots_casino_campaign(camp: dict) -> bool:
     text = f"{name} {cat_name} {cat_slug}".lower()
     return any(k in text for k in KEYWORD_FILTER)
 
+# ================== ASYNC BACKGROUND DETECTOR (SINGLE API) ==================
 async def async_campaign_checker_loop():
+    global active_drops_streamers
     while True:
         try:
             url = "https://web.kick.com/api/v1/drops/campaigns"
@@ -119,6 +120,11 @@ async def async_campaign_checker_loop():
             res = requests.get(url, headers=headers, timeout=5)
             if res.status_code == 200:
                 campaigns = res.json().get("data", [])
+                
+                processed_streamers_in_fetch = set()
+                temp_live_list = []
+                top_drops_db = get_top_drops_counts()
+
                 for camp in campaigns:
                     camp_id = str(camp.get("id"))
                     if camp_id in seen_campaign_ids:
@@ -138,17 +144,34 @@ async def async_campaign_checker_loop():
 
                     if target_streamer:
                         s_lower = target_streamer.lower()
+                        
+                        # Filter agar tidak double dalam 1 fetch yang sama
+                        if s_lower in processed_streamers_in_fetch:
+                            continue
+                        processed_streamers_in_fetch.add(s_lower)
+
                         camp_name = camp.get("name", "Slots Drop")
+
+                        # Simpan ke list aktif untuk dashboard
+                        drop_score = top_drops_db.get(s_lower, 0)
+                        temp_live_list.append({
+                            "slug": s_lower,
+                            "title": camp_name,
+                            "viewers_display": "Drop Active",
+                            "raw_viewers": 1,
+                            "sort_value": drop_score,
+                            "drop_count": drop_score,
+                            "language": "EN"
+                        })
 
                         add_to_daily_blacklist_with_delay(s_lower, delay_minutes=10)
                         
-                        # ---> TAMBAHKAN KODE INI SUPAYA OTOMATIS PUSH KE VPS <---
+                        # Sync ke VPS
                         try:
                             vps_payload = {"streamer": s_lower, "value": camp_name}
                             requests.post("https://kickbot-tracker.online/api/v1/record-drop", json=vps_payload, timeout=5)
                         except Exception as e:
                             print(f"Gagal sync ke VPS: {e}")
-                        # ---------------------------------------------------------
 
                         msg_t1 = (
                             f"🚨 <b>[TIPE 1: DROP RELEASED REAL-TIME!]</b>\n\n"
@@ -169,6 +192,9 @@ async def async_campaign_checker_loop():
                         )
                         send_telegram_sync(msg_t3)
 
+                if temp_live_list:
+                    active_drops_streamers = temp_live_list
+
         except Exception as e:
             pass
 
@@ -185,51 +211,6 @@ def get_top_drops_counts() -> Dict[str, int]:
     rows = cursor.fetchall()
     conn.close()
     return {row[0].lower(): row[1] for row in rows}
-
-def fetch_kick_live_slots_v2() -> List[dict]:
-    url = f"https://api.kick.com/public/v2/livestreams?category_id={CATEGORY_ID}&limit={LIMIT_LIVE}"
-    headers = {
-        "Authorization": f"Bearer {KICK_ACCESS_TOKEN}",
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    
-    top_drops_db = get_top_drops_counts()
-
-    try:
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            json_data = res.json()
-            data_list = json_data.get("data", [])
-            live_list = []
-
-            for item in data_list:
-                channel_obj = item.get("channel", {})
-                broadcaster = item.get("broadcaster_user", {})
-                slug = channel_obj.get("slug") or broadcaster.get("username") or "unknown"
-                slug = slug.lower()
-
-                raw_viewers = item.get("viewer_count") or 0
-                drop_score = top_drops_db.get(slug, 0)
-                sort_val = (drop_score * 1000000) + raw_viewers
-
-                live_list.append({
-                    "slug": slug,
-                    "title": item.get("title") or "-",
-                    "viewers_display": f"{raw_viewers:,} Viewers",
-                    "raw_viewers": raw_viewers,
-                    "sort_value": sort_val,
-                    "drop_count": drop_score,
-                    "language": item.get("language_code") or "EN"
-                })
-
-            live_list.sort(key=lambda x: x["sort_value"], reverse=True)
-            return live_list
-
-    except Exception as e:
-        print(f"⚠️ Error Kick API v2: {e}")
-
-    return []
 
 def assign_stable_targets_for_bot(bot_id: str, live_streamers: List[dict]) -> List[str]:
     current_assigned = bot_assignments.get(bot_id, {}).get("targets", [])
@@ -263,11 +244,10 @@ def read_root():
 
 @app.get("/assign-streamer/{bot_id}")
 def assign_streamer(bot_id: str):
-    live_data = fetch_kick_live_slots_v2()
     now_ts = time.time()
     
     if bot_id not in bot_assignments:
-        targets = assign_stable_targets_for_bot(bot_id, live_data)
+        targets = assign_stable_targets_for_bot(bot_id, active_drops_streamers)
         bot_assignments[bot_id] = {
             "mode": "AUTO",
             "targets": targets,
@@ -277,7 +257,7 @@ def assign_streamer(bot_id: str):
     else:
         bot_assignments[bot_id]["last_seen"] = now_ts
         if bot_assignments[bot_id].get("mode") == "AUTO":
-            new_targets = assign_stable_targets_for_bot(bot_id, live_data)
+            new_targets = assign_stable_targets_for_bot(bot_id, active_drops_streamers)
             bot_assignments[bot_id]["targets"] = new_targets
             if "start_times" not in bot_assignments[bot_id]:
                 bot_assignments[bot_id]["start_times"] = {}
@@ -389,7 +369,6 @@ GLOBAL_CSS = """
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard():
-    live_streamers = fetch_kick_live_slots_v2()
     now_ts = time.time()
     now_wib = datetime.now(WIB_TZ).strftime("%H:%M:%S WIB")
 
@@ -412,34 +391,37 @@ def get_dashboard():
         sidebar_drops_rows = '<div style="font-size:12px; color:#5c6b73; font-style:italic;">Belum ada histori drop tercatat.</div>'
 
     ranking_cards = ""
-    for idx, item in enumerate(live_streamers[:15], 1):
-        s_slug = item['slug']
-        is_bl = is_blacklisted_today(s_slug)
-        is_pending = s_slug in blacklisted_pending_until
+    if active_drops_streamers:
+        for idx, item in enumerate(active_drops_streamers[:15], 1):
+            s_slug = item['slug']
+            is_bl = is_blacklisted_today(s_slug)
+            is_pending = s_slug in blacklisted_pending_until
 
-        status_badge = '<span class="priority-tag">🎁 Priority Drops</span>'
-        if is_bl:
-            status_badge = '<span style="background:#3f1721; color:#ff4d4f; border:1px solid #ff4d4f44; font-size:10px; font-weight:700; padding:4px 8px; border-radius:5px;">🚫 Blacklisted Today</span>'
-        elif is_pending:
-            rem_sec = int(blacklisted_pending_until[s_slug] - now_ts)
-            status_badge = f'<span style="background:#3d3215; color:#ffc107; border:1px solid #ffc10744; font-size:10px; font-weight:700; padding:4px 8px; border-radius:5px;">⏳ Grace {rem_sec//60}m {rem_sec%60}s</span>'
+            status_badge = '<span class="priority-tag">🎁 Priority Drops</span>'
+            if is_bl:
+                status_badge = '<span style="background:#3f1721; color:#ff4d4f; border:1px solid #ff4d4f44; font-size:10px; font-weight:700; padding:4px 8px; border-radius:5px;">🚫 Blacklisted Today</span>'
+            elif is_pending:
+                rem_sec = int(blacklisted_pending_until[s_slug] - now_ts)
+                status_badge = f'<span style="background:#3d3215; color:#ffc107; border:1px solid #ffc10744; font-size:10px; font-weight:700; padding:4px 8px; border-radius:5px;">⏳ Grace {rem_sec//60}m {rem_sec%60}s</span>'
 
-        ranking_cards += f"""
-        <div class="stream-item">
-            <div class="stream-left">
-                <div class="stream-rank">#{idx}</div>
-                <div style="width:8px; height:8px; background:#00e676; border-radius:50%;"></div>
-                <div>
-                    <div class="stream-name">{s_slug} <span style="font-size:10px; color:#5c6b73;">[{item['language'].upper()}]</span></div>
-                    <div class="stream-title">{item['title']}</div>
+            ranking_cards += f"""
+            <div class="stream-item">
+                <div class="stream-left">
+                    <div class="stream-rank">#{idx}</div>
+                    <div style="width:8px; height:8px; background:#00e676; border-radius:50%;"></div>
+                    <div>
+                        <div class="stream-name">{s_slug}</div>
+                        <div class="stream-title">{item['title']}</div>
+                    </div>
+                </div>
+                <div style="display:flex; align-items:center; gap:12px;">
+                    <div class="viewers-count">Active Drops</div>
+                    {status_badge}
                 </div>
             </div>
-            <div style="display:flex; align-items:center; gap:12px;">
-                <div class="viewers-count">{item['viewers_display']}</div>
-                {status_badge}
-            </div>
-        </div>
-        """
+            """
+    else:
+        ranking_cards = '<div style="font-size:12px; color:#5c6b73; font-style:italic; padding:12px;">Menunggu event drops aktif dari API...</div>'
 
     return f"""
     <!DOCTYPE html>
@@ -450,8 +432,8 @@ def get_dashboard():
             <div class="header-title">
                 <div style="font-size:24px;">🎮</div>
                 <div>
-                    <h1>Kick Bot - Live Tracker</h1>
-                    <div class="header-subtitle">Official Kick API v2 | Jam Lokal: <span>{now_wib}</span></div>
+                    <h1>Kick Bot - Drops Monitor</h1>
+                    <div class="header-subtitle">Single API Drops Mode | Jam Lokal: <span>{now_wib}</span></div>
                 </div>
             </div>
             <div>
@@ -486,8 +468,8 @@ def get_dashboard():
         <div class="dashboard-layout">
             <div class="panel-card">
                 <div class="panel-header">
-                    <h2>🔥 CATEGORY SLOTS LIVE RANKING (TOP 15 REAL-TIME)</h2>
-                    <div style="font-size:11px; color:#5c6b73;">Kick API v2 Total Live: <strong>{len(live_streamers)} Streamers</strong></div>
+                    <h2>🔥 ACTIVE DROPS STREAMERS (REAL-TIME)</h2>
+                    <div style="font-size:11px; color:#5c6b73;">Total Terdeteksi: <strong>{len(active_drops_streamers)} Streamers</strong></div>
                 </div>
                 <div class="stream-list">{ranking_cards}</div>
             </div>
@@ -504,16 +486,13 @@ def get_dashboard():
 
 @app.get("/bot-manager", response_class=HTMLResponse)
 def get_bot_manager_page():
-    live_streamers = fetch_kick_live_slots_v2()
     now_ts = time.time()
     bot_table_rows = ""
 
-    # Generate 200+ list streamer live untuk isi dropdown otomatis (dari viewer tertinggi ke terkecil)
-    select_options = '<option value="">-- Pilih Streamer Live ({len(live_streamers)}) --</option>'
-    for item in live_streamers:
+    select_options = f'<option value="">-- Pilih Streamer Aktif ({len(active_drops_streamers)}) --</option>'
+    for item in active_drops_streamers:
         s_slug = item['slug']
-        v_disp = item['viewers_display']
-        select_options += f'<option value="{s_slug}">{s_slug} ({v_disp})</option>'
+        select_options += f'<option value="{s_slug}">{s_slug}</option>'
 
     for b_id in ALL_REGISTERED_BOTS:
         b_data = bot_assignments.get(b_id, {})
